@@ -174,28 +174,41 @@ class FSDPSFTTrainer:
         self.train_sampler = DistributedSampler(
             self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True
         )
+
+        # Use default collate function
+        from torch.utils.data import default_collate
+        self.train_collate_fn = default_collate
+
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=config.data.train_batch_size,
             sampler=self.train_sampler,
-            num_workers=8,
+            collate_fn=self.train_collate_fn,
+            num_workers=8,  # Set to 0 to avoid deadlock in distributed training
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
         )
 
-        self.val_sampler = DistributedSampler(
-            self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
-        )
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=config.data.micro_batch_size_per_gpu,
-            sampler=self.val_sampler,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=True,
-            pin_memory_device=device_name,
-        )
+        # self.val_sampler = DistributedSampler(
+        #     self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True
+        # )
+
+        # Use default collate function for validation
+        self.val_collate_fn = default_collate
+
+        # self.val_collate_fn = collate_fn
+
+        # self.val_dataloader = StatefulDataLoader(
+        #     dataset=self.val_dataset,
+        #     batch_size=config.data.micro_batch_size_per_gpu,
+        #     sampler=self.val_sampler,
+        #     collate_fn=self.val_collate_fn,
+        #     num_workers=2,  # Set to 0 to avoid deadlock in distributed training
+        #     pin_memory=True,
+        #     drop_last=True,
+        #     pin_memory_device=device_name,
+        # )
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -362,15 +375,34 @@ class FSDPSFTTrainer:
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
-    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
-        """Compute loss with optional sequence parallelism and remove padding features"""
+    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1, loss_agg_mode=None):
+        """Compute loss with optional sequence parallelism and remove padding features
+
+        Args:
+            batch: Input batch data
+            do_backward: Whether to perform backward pass
+            n_micro_batches: Number of micro batches for gradient accumulation
+            loss_agg_mode: Loss aggregation mode. Options: "token-mean", "turn-mean", "dialogue-mean"
+                - "token-mean": Average loss over all tokens (default)
+                - "turn-mean": Average loss over all turns (each turn is averaged first, then all turns are averaged)
+                - "dialogue-mean": Average loss over all dialogues (each dialogue is averaged first, then all dialogues are averaged)
+                If None, reads from config.data.loss_agg_mode, defaults to "token-mean"
+        """
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+
+        # Get loss aggregation mode from config if not provided
+        if loss_agg_mode is None:
+            loss_agg_mode = getattr(self.config.data, "loss_agg_mode", "token-mean")
 
         # Move inputs to GPU and prepare loss mask
         input_ids = batch["input_ids"].to(self.device_name)
-        attention_mask = batch["attention_mask"].to(self.device_name)
+        if "attention_mask" in batch:
+            attention_mask = batch["attention_mask"].to(self.device_name)
+        else:
+            attention_mask = None   # 开启flash attention varlen模式时，attention_mask为None（samplepack时启用）
         position_ids = batch["position_ids"].to(self.device_name)
         loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Context manager for sequence parallel if needed
@@ -379,9 +411,11 @@ class FSDPSFTTrainer:
             if not use_sp:
                 # Standard forward pass without sequence parallel
                 labels = input_ids[:, 1:].contiguous()
+
                 output = self.fsdp_model(
                     input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
                 )
+
                 logits = output.logits
 
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -393,6 +427,9 @@ class FSDPSFTTrainer:
                 shift_labels = shift_labels.to(shift_logits.device)
                 loss = loss_fct(shift_logits, shift_labels)
                 loss = loss * loss_mask.to(loss.device)
+                # Save batch_size and seq_len for later use in loss aggregation
+                batch_size = input_ids.shape[0]
+                seq_len = input_ids.shape[1] - 1
             else:
                 # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
                 # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
@@ -401,6 +438,7 @@ class FSDPSFTTrainer:
                 # This is implemented by the DistributedSampler
 
                 batch_size, seqlen = input_ids.shape
+                seq_len = seqlen - 1  # -1 because we remove last token's loss
                 # Remove padding
                 input_ids_rmpad, indices, *_ = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
@@ -455,13 +493,119 @@ class FSDPSFTTrainer:
             else:
                 dp_size = 1
 
-            loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+            # Aggregate loss based on loss_agg_mode
+            if loss_agg_mode == "token-mean":
+                # Original token-mean: average over all tokens
+                loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+            elif loss_agg_mode == "turn-mean":
+                # Turn-mean: average over all turns (each turn averaged first, then all turns averaged)
+                loss = self._compute_turn_mean_loss(loss, loss_mask, batch_size, seq_len, dp_size, input_ids=input_ids)
+            elif loss_agg_mode == "dialogue-mean":
+                # Dialogue-mean: average over all dialogues (each dialogue averaged first, then all dialogues averaged)
+                loss = self._compute_dialogue_mean_loss(loss, loss_mask, batch_size, seq_len, dp_size)
+            else:
+                raise ValueError(f"Unknown loss_agg_mode: {loss_agg_mode}. Must be one of: 'token-mean', 'turn-mean', 'dialogue-mean'")
 
             loss = loss / n_micro_batches  # normalize loss
 
             if do_backward:
                 loss.backward()
             return loss
+
+    def _compute_turn_mean_loss(self, loss, loss_mask, batch_size, seq_len, dp_size, input_ids=None):
+        """Compute turn-mean loss: average over all turns.
+
+        Each turn is identified by consecutive 1s in loss_mask (assistant responses).
+        First average loss within each turn, then average over all turns.
+
+        Args:
+            loss: Flattened loss tensor of shape (batch_size * seq_len,)
+            loss_mask: Flattened loss mask tensor of shape (batch_size * seq_len,)
+            batch_size: Batch size
+            seq_len: Sequence length
+            dp_size: Data parallel size for scaling
+        """
+        # Reshape loss and loss_mask back to (batch_size, seq_len)
+        loss_reshaped = loss.view(batch_size, seq_len)
+        loss_mask_reshaped = loss_mask.view(batch_size, seq_len)
+
+        turn_losses = []
+
+        # Process each sample in the batch
+        for b in range(batch_size):
+            sample_loss = loss_reshaped[b]  # (seq_len,)
+            sample_mask = loss_mask_reshaped[b]  # (seq_len,)
+
+            # Identify turn boundaries: consecutive 1s in loss_mask represent a turn
+            # Find where mask changes from 0 to 1 (turn start) or 1 to 0 (turn end)
+            if sample_mask.sum() == 0:
+                continue  # Skip samples with no valid tokens
+
+            # Find turn boundaries by detecting transitions
+            # Pad mask to handle boundaries at start and end
+            mask_padded = torch.cat([torch.tensor([0], device=sample_mask.device), sample_mask, torch.tensor([0], device=sample_mask.device)])
+            # Find transitions: 0->1 (turn start) and 1->0 (turn end)
+            # turn_starts and turn_ends are indices in mask_padded (offset by 1 from sample_mask)
+            turn_starts = torch.where((mask_padded[:-1] == 0) & (mask_padded[1:] == 1))[0]
+            turn_ends = torch.where((mask_padded[:-1] == 1) & (mask_padded[1:] == 0))[0]
+            # # print for debug
+            # for start, end in zip(turn_starts, turn_ends):
+            #     print(self.tokenizer.decode(input_ids[b][start: end]))
+
+            # Process each turn
+            # turn_starts and turn_ends are indices in mask_padded
+            # Since mask_padded = [0] + sample_mask + [0], indices in mask_padded directly correspond to sample_mask indices
+            # (the first element [0] is at index 0, sample_mask starts at index 1)
+            for start, end in zip(turn_starts, turn_ends):
+                # start and end are indices in mask_padded, which directly map to sample_mask indices
+                turn_mask = sample_mask[start:end]
+                turn_loss = sample_loss[start:end]
+
+                if turn_mask.sum() > 0:
+                    # Average loss within this turn
+                    turn_mean_loss = torch.sum(turn_loss * turn_mask) / (turn_mask.sum() + 1e-8)
+                    turn_losses.append(turn_mean_loss)
+
+        if len(turn_losses) == 0:
+            # Fallback to token-mean if no turns found
+            valid_token_this_rank = torch.sum(loss_mask)
+            return torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+
+        # Average over all turns
+        all_turn_losses = torch.stack(turn_losses)
+        loss = torch.mean(all_turn_losses) * dp_size
+
+        return loss
+
+    def _compute_dialogue_mean_loss(self, loss, loss_mask, batch_size, seq_len, dp_size):
+        """Compute dialogue-mean loss: average over all dialogues.
+
+        First average loss within each dialogue, then average over all dialogues.
+
+        Args:
+            loss: Flattened loss tensor of shape (batch_size * seq_len,)
+            loss_mask: Flattened loss mask tensor of shape (batch_size * seq_len,)
+            batch_size: Batch size
+            seq_len: Sequence length
+            dp_size: Data parallel size for scaling
+        """
+        # Reshape loss and loss_mask back to (batch_size, seq_len)
+        loss_reshaped = loss.view(batch_size, seq_len)
+        loss_mask_reshaped = loss_mask.view(batch_size, seq_len)
+
+        # Compute per-dialogue loss: sum of token losses / number of valid tokens per dialogue
+        dialogue_losses = torch.sum(loss_reshaped * loss_mask_reshaped, dim=-1) / (torch.sum(loss_mask_reshaped, dim=-1) + 1e-8)
+        valid_dialogues = (torch.sum(loss_mask_reshaped, dim=-1) > 0).float()
+
+        # Average over all dialogues
+        if valid_dialogues.sum() > 0:
+            loss = torch.sum(dialogue_losses * valid_dialogues) / (valid_dialogues.sum() + 1e-8) * dp_size
+        else:
+            # Fallback to token-mean if no valid dialogues
+            valid_token_this_rank = torch.sum(loss_mask)
+            loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+
+        return loss
 
     def training_step(self, batch: TensorDict):
         start_time = time.time()
@@ -769,22 +913,22 @@ class FSDPSFTTrainer:
                 is_valid_step = global_step % self.config.trainer.test_freq == 0
                 is_save_step = global_step % self.config.trainer.save_freq == 0
 
-                # early exit or validation step
-                if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                    # Perform validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
-                            self.device_name
-                        )
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
-                        last_valid_metric = metric
-                    torch.distributed.barrier()
+                # # early exit or validation step
+                # if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
+                #     # Perform validation
+                #     val_losses = []
+                #     for val_data in self.val_dataloader:
+                #         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
+                #             self.device_name
+                #         )
+                #         val_loss = self.validation_step(val_data)
+                #         val_losses.append(val_loss)
+                #     if rank == 0:
+                #         val_loss = torch.mean(torch.stack(val_losses))
+                #         metric = {"val/loss": val_loss.detach().item()}
+                #         tracking.log(data=metric, step=global_step)
+                #         last_valid_metric = metric
+                #     torch.distributed.barrier()
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
                     self.save_checkpoint(step=global_step)
@@ -811,13 +955,19 @@ def run_sft(config):
     from verl.utils import hf_tokenizer
 
     local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
-    tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
+    # Use tokenizer_path if specified, otherwise use model path
+    tokenizer_path = config.model.get("tokenizer_path", None)
+    if tokenizer_path is not None:
+        local_tokenizer_path = copy_to_local(src=tokenizer_path, verbose=True)
+        tokenizer = hf_tokenizer(local_tokenizer_path, trust_remote_code=config.model.trust_remote_code)
+    else:
+        tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
     train_dataset = create_sft_dataset(
         config.data.train_files, config.data, tokenizer, max_samples=config.data.get("train_max_samples", -1)
     )
-    val_dataset = create_sft_dataset(
-        config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
-    )
+    # val_dataset = create_sft_dataset(
+    #     config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
+    # )
 
     trainer = FSDPSFTTrainer(
         config=config,
@@ -825,7 +975,8 @@ def run_sft(config):
         ulysses_device_mesh=ulysses_device_mesh,
         tokenizer=tokenizer,
         train_dataset=train_dataset,
-        val_dataset=val_dataset,
+        # val_dataset=val_dataset,
+        val_dataset=None,
     )
 
     trainer.fit()

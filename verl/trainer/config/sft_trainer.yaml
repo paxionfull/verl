@@ -24,6 +24,7 @@ data:
   max_length: 1024
   truncation: error
   balance_dp_token: False
+  loss_agg_mode: token-mean  # Loss aggregation mode: "token-mean", "turn-mean", or "dialogue-mean"
   chat_template: null
   custom_cls:
     path: null
