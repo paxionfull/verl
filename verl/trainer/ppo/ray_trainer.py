@@ -59,7 +59,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-
+from verl.workers.reward_manager import ToolRLRewardManager
 
 @dataclass
 class ResourcePoolManager:
@@ -1072,11 +1072,10 @@ class RayPPOTrainer:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
-                            rm_scores = None
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
                                 rm_scores = self.rm_wg.compute_rm_score(batch)
                                 batch = batch.union(rm_scores)
-                            reward_baseline_tensor, _ = compute_reward(batch, self.reward_fn)
+                            reward_baseline_tensor, _ = compute_reward(batch, self.reward_fn, step=self.global_steps)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
                             keys_to_pop = set(gen_baseline_output.batch.keys())
@@ -1103,6 +1102,8 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    print("==========batch.batch keys: ", batch.batch.keys())
+                    print("==========use_rm: ", self.use_rm)
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1114,8 +1115,12 @@ class RayPPOTrainer:
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            if isinstance(self.reward_fn, ToolRLRewardManager):
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, step=self.global_steps)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                    # import pdb; pdb.set_trace()
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
