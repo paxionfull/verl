@@ -15,7 +15,11 @@
 from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncLLMServerManager
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
+from .tau_agent_loop import TauAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+# Force class registration via side effects of module import.
+# Each AgentLoop subclass uses the @register decorator in agent_loop.py,
+# so importing them here ensures they are added to the global registry.
+_ = [SingleTurnAgentLoop, ToolAgentLoop, TauAgentLoop]
 
 __all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker"]

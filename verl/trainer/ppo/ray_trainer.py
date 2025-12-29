@@ -515,7 +515,10 @@ class RayPPOTrainer:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        if batch.batch is not None:
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        else:
+            batch_keys_to_pop = []
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -544,8 +547,10 @@ class RayPPOTrainer:
             test_batch = DataProto.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
+                # Fix: use len(test_batch) instead of len(test_batch.batch)
+                # len(test_batch) handles both cases: when batch.batch is None or not None
                 test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(len(test_batch))], dtype=object
                 )
 
             # repeat test batch
@@ -558,9 +563,13 @@ class RayPPOTrainer:
                 return {}
 
             # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            # import ipdb; ipdb.set_trace()
+            if test_batch.batch is not None:
+                input_ids = test_batch.batch["input_ids"]
+                # TODO: Can we keep special tokens except for padding tokens?
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            elif test_batch.non_tensor_batch is not None:
+                input_texts = test_batch.non_tensor_batch["instruction"].tolist()
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
@@ -959,6 +968,63 @@ class RayPPOTrainer:
             global_partition_lst[idx] = ordered_partition
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        
+        # ========== 调试代码开始 ==========
+        # import logging
+        # logger = logging.getLogger(__name__)
+        
+        # logger.warning(f"[DEBUG reorder] ========== Batch Reorder Debug Info ==========")
+        # logger.warning(f"[DEBUG reorder] batch.batch: {batch.batch}")
+        # logger.warning(f"[DEBUG reorder] batch.batch is None: {batch.batch is None}")
+        
+        # if batch.batch is not None:
+        #     logger.warning(f"[DEBUG reorder] batch.batch.batch_size: {batch.batch.batch_size}")
+        #     logger.warning(f"[DEBUG reorder] batch.batch keys: {list(batch.batch.keys())}")
+        #     # 检查每个tensor的第一个维度
+        #     for key, tensor in batch.batch.items():
+        #         if hasattr(tensor, 'shape'):
+        #             logger.warning(f"[DEBUG reorder]   batch.batch['{key}'].shape[0]: {tensor.shape[0]}")
+        # else:
+        #     logger.error(f"[DEBUG reorder] ⚠️ ERROR: batch.batch is None!")
+        
+        # logger.warning(f"[DEBUG reorder] len(batch): {len(batch)}")
+        # logger.warning(f"[DEBUG reorder] batch.non_tensor_batch keys: {list(batch.non_tensor_batch.keys())}")
+        
+        # logger.warning(f"[DEBUG reorder] global_idx: {global_idx}")
+        # logger.warning(f"[DEBUG reorder] global_idx dtype: {global_idx.dtype}")
+        # logger.warning(f"[DEBUG reorder] global_idx shape: {global_idx.shape}")
+        # logger.warning(f"[DEBUG reorder] global_idx len: {len(global_idx)}")
+        
+        # if len(global_idx) > 0:
+        #     logger.warning(f"[DEBUG reorder] global_idx min: {global_idx.min().item()}, max: {global_idx.max().item()}")
+        #     logger.warning(f"[DEBUG reorder] global_idx unique count: {len(torch.unique(global_idx))}")
+        #     logger.warning(f"[DEBUG reorder] global_idx values: {global_idx.tolist()}")
+        # 
+        # 检查索引范围
+        # if batch.batch is not None:
+        #     batch_size = batch.batch.batch_size[0]
+        #     logger.warning(f"[DEBUG reorder] batch_size from batch.batch.batch_size[0]: {batch_size}")
+            
+        #     if len(global_idx) > 0:
+        #         if global_idx.max() >= batch_size:
+        #             logger.error(f"[DEBUG reorder] ⚠️ ERROR: global_idx contains index {global_idx.max().item()} >= batch_size {batch_size}")
+        #         if global_idx.min() < 0:
+        #             logger.error(f"[DEBUG reorder] ⚠️ ERROR: global_idx contains negative index {global_idx.min().item()}")
+        #         if len(global_idx) != batch_size:
+        #             logger.error(f"[DEBUG reorder] ⚠️ ERROR: global_idx length {len(global_idx)} != batch_size {batch_size}")
+        #         else:
+        #             logger.warning(f"[DEBUG reorder] ✓ Index range check passed")
+        # else:
+        #     logger.error(f"[DEBUG reorder] ⚠️ Cannot check index range: batch.batch is None")
+        
+        # # 检查 global_partition_lst
+        # logger.warning(f"[DEBUG reorder] global_partition_lst length: {len(global_partition_lst)}")
+        # for i, partition in enumerate(global_partition_lst):
+        #     logger.warning(f"[DEBUG reorder]   partition[{i}]: len={len(partition)}, values={partition}")
+        
+        # logger.warning(f"[DEBUG reorder] ===============================================")
+        # ========== 调试代码结束 ==========
+        
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
@@ -1031,13 +1097,20 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
+                if batch.batch is not None:
+                    # add uid to batch
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
+                else:
+                    # Fix: use len(batch) instead of len(batch.non_tensor_batch)
+                    # len(batch.non_tensor_batch) returns the number of keys in the dict, not the array size
+                    # len(batch) returns the actual batch size (first non_tensor_batch array's shape[0])åååå
+                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
 
                 gen_batch = self._get_gen_batch(batch)
 

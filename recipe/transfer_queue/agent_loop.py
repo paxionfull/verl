@@ -37,6 +37,16 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
             self.reward_model_manager.wake_up()
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
+        # print(f"[DEBUG] Chunk check:")
+        # print(f"  prompts size: {len(prompts)}")
+        # print(f"  num_workers: {len(self.agent_loop_workers)}")
+        # print(f"  num_chunks: {len(chunkes)}")
+        # for i, chunk in enumerate(chunkes):
+        #     chunk_len = len(chunk) if hasattr(chunk, '__len__') else 'N/A'
+        #     chunk_batch = chunk.batch if hasattr(chunk, 'batch') else 'N/A'
+        #     print(f"  chunk[{i}]: len={chunk_len}, batch={chunk_batch is not None if chunk_batch != 'N/A' else 'N/A'}")
+        #     if chunk_len == 0:
+        #         print(f"  ⚠️ WARNING: chunk[{i}] is EMPTY!")
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)

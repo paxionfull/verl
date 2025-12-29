@@ -107,9 +107,12 @@ def unpad_dataproto(data: "DataProto", pad_size):
 
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
     """Union two tensordicts."""
-    assert tensor_dict1.batch_size == tensor_dict2.batch_size, (
-        f"Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}"
-    )
+    if tensor_dict1 is None:
+        tensor_dict1 = TensorDict(batch_size=tensor_dict2.batch_size)
+    else:
+        assert tensor_dict1.batch_size == tensor_dict2.batch_size, (
+            f"Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}"
+        )
     for key in tensor_dict2.keys():
         if key not in tensor_dict1.keys():
             tensor_dict1[key] = tensor_dict2[key]

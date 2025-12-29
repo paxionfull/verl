@@ -331,6 +331,13 @@ class AgentLoopWorkerBase:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        batch_len = len(batch)
+        print(f"[DEBUG Worker] Received batch: len={batch_len}, batch.batch={batch.batch is not None}")
+        if batch_len == 0:
+            print(f"  ⚠️ WARNING: Worker received EMPTY batch!")
+            print(f"  batch.batch: {batch.batch}")
+            print(f"  batch.non_tensor_batch: {batch.non_tensor_batch}")
+
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -374,9 +381,53 @@ class AgentLoopWorkerBase:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
+        # ========== 调试代码开始 ==========
+        # import logging
+        # logger = logging.getLogger(__name__)
+        
+        # batch_len = len(batch)
+        # logger.warning(f"[DEBUG IndexError] ========== Batch Size Consistency Check ==========")
+        # logger.warning(f"[DEBUG IndexError] len(batch): {batch_len}")
+        
+        # if batch.batch is not None:
+        #     batch_batch_size = batch.batch.batch_size[0]
+        #     logger.warning(f"[DEBUG IndexError] batch.batch.batch_size[0]: {batch_batch_size}")
+        #     if batch_batch_size != batch_len:
+        #         logger.error(f"[DEBUG IndexError] ⚠️ ERROR: batch.batch.batch_size[0] ({batch_batch_size}) != len(batch) ({batch_len})")
+        # else:
+        #     logger.warning(f"[DEBUG IndexError] batch.batch is None")
+        
+        # logger.warning(f"[DEBUG IndexError] batch.non_tensor_batch keys: {list(batch.non_tensor_batch.keys())}")
+        # inconsistent_keys = []
+        # for key, val in batch.non_tensor_batch.items():
+        #     val_size = val.shape[0] if hasattr(val, 'shape') else len(val) if hasattr(val, '__len__') else 'N/A'
+        #     logger.warning(f"[DEBUG IndexError] non_tensor_batch['{key}'].shape[0]: {val_size}")
+        #     if val_size != 'N/A' and val_size != batch_len:
+        #         inconsistent_keys.append(key)
+        #         logger.error(f"[DEBUG IndexError] ⚠️ ERROR: non_tensor_batch['{key}'] size {val_size} != len(batch) {batch_len}")
+        
+        # if inconsistent_keys:
+        #     logger.error(f"[DEBUG IndexError] ⚠️ Found {len(inconsistent_keys)} inconsistent keys: {inconsistent_keys}")
+        #     min_size = min([batch.non_tensor_batch[k].shape[0] for k in inconsistent_keys])
+        #     logger.error(f"[DEBUG IndexError] This will cause IndexError when accessing index >= {min_size}")
+        # else:
+        #     logger.warning(f"[DEBUG IndexError] ✓ All non_tensor_batch sizes match len(batch)")
+        
+        # logger.warning(f"[DEBUG IndexError] Will iterate over range({batch_len}): {list(range(batch_len))}")
+        # logger.warning(f"[DEBUG IndexError] ===================================================")
+        # ========== 调试代码结束 ==========
+        
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
+            # ========== 调试代码：检查索引访问 ==========
+            if i >= batch_len:
+                logger.error(f"[DEBUG IndexError] ⚠️ ERROR: i={i} >= len(batch)={batch_len}")
+            for key, val in batch.non_tensor_batch.items():
+                val_size = val.shape[0] if hasattr(val, 'shape') else len(val) if hasattr(val, '__len__') else 'N/A'
+                if val_size != 'N/A' and i >= val_size:
+                    logger.error(f"[DEBUG IndexError] ⚠️ ERROR: Accessing non_tensor_batch['{key}'][{i}] but size is {val_size}")
+            # ========== 调试代码结束 ==========
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(
                 asyncio.create_task(
@@ -411,6 +462,7 @@ class AgentLoopWorkerBase:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
+            print(f"[AgentLoopWorker._run_agent_loop] Instantiating agent_loop: {agent_name}")
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=_DummyConfig(config=self.config),
@@ -418,12 +470,20 @@ class AgentLoopWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
+            print(f"[AgentLoopWorker._run_agent_loop] Calling agent_loop.run() for {agent_name}")
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
-        output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        print(len(output.prompt_ids))
+        print(len(output.response_ids))
+        # print(output.extra_fields["messages"][1:])
+
+        if "raw_prompt" in kwargs:
+            output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        elif "instruction" in kwargs:
+            output.extra_fields["raw_prompt"] = kwargs["instruction"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -570,6 +630,13 @@ class AgentLoopWorkerBase:
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        input_len = len(inputs)
+        # print(f"[DEBUG Postprocess] Inputs: len={input_len}, inputs={inputs}")
+        if input_len == 0:
+            print(f"  ⚠️ WARNING: Postprocess received EMPTY inputs!")
+            print(f"  inputs: {inputs}")
+            return DataProto()
+
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
@@ -772,13 +839,25 @@ class AgentLoopManager:
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
+            # 为第 0 个 AgentLoopWorker 单独注入调试用环境变量，避免所有 worker 都进入 pdb
+            options_kwargs = {
+                "name": f"agent_loop_worker_{i}",
+                "scheduling_strategy": ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=True
+                ),
+            }
+            if i == 0:
+                # 只在第一个 worker 上标记为调试 worker
+                options_kwargs["runtime_env"] = {
+                    "env_vars": {
+                        "IS_DEBUG_WORKER": "1",
+                    }
+                }
+
             self.agent_loop_workers.append(
-                self.agent_loop_workers_class.options(
-                    name=f"agent_loop_worker_{i}",
-                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=True
-                    ),
-                ).remote(self.config, self.server_handles, self.reward_router_address)
+                self.agent_loop_workers_class.options(**options_kwargs).remote(
+                    self.config, self.server_handles, self.reward_router_address
+                )
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
