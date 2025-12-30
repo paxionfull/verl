@@ -16,8 +16,9 @@ import copy
 import json
 import logging
 import os
+from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 from uuid import uuid4
 
 import regex
@@ -110,14 +111,14 @@ class QwenToolParser(ToolParser):
         self.im_end_token = "<|im_end|>"
 
     @rollout_trace_op
-    async def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[FunctionCall]]:
+    async def extract_tool_calls(self, responses_ids: list[int], compute_reward: bool = False) -> tuple[str, list[FunctionCall], Optional[Dict[str, float]]]:
         """Extract tool calls from Qwen model responses.
 
         Args:
             responses_ids: Token IDs from the model response
 
         Returns:
-            Tuple of (remaining_text, list_of_function_calls)
+            Tuple of (remaining_text, list_of_function_calls, Optional[Dict[str, float]], None)
         """
         loop = asyncio.get_running_loop()
 
@@ -126,18 +127,55 @@ class QwenToolParser(ToolParser):
             None, lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=True)
         )
 
+        # ==============compute reward===============
+        reward_info = dict()
+        if compute_reward is True:
+            if self.tool_call_start_token in text:
+                # <tool_call> end with </tool_call>
+                if self.tool_call_end_token in text:
+                    tool_call_token_reward = 1.0
+
+                    # <tool_call> content </tool_call> -> content is not empty; content is json format
+                    matches = self.tool_call_regex.findall(text)
+                    try:
+                        for match in matches:
+                            assert len(match.strip()) > 0
+                            # Parse the JSON inside the tool_call tags
+                            function_call = json.loads(match.strip())
+
+                            # Extract name and arguments
+                            name = function_call.get("name")
+                            arguments = function_call.get("arguments", {})
+
+                            assert name is not None
+                            # Convert arguments to JSON string if it's a dict
+                            if isinstance(arguments, dict):
+                                arguments_str = json.dumps(arguments, ensure_ascii=False)
+                            else:
+                                arguments_str = str(arguments)
+                        tool_call_content_format_reward = 1.0
+                    except Exception as e:
+                        tool_call_content_format_reward = 0.0
+                else:
+                    tool_call_token_reward = 0.0
+                    tool_call_content_format_reward = 0.0
+                reward_info["tool_call_token_reward"] = tool_call_token_reward
+                reward_info["tool_call_content_format_reward"] = tool_call_content_format_reward
+        # ==============compute reward===============
+        
         # Check if there are any tool calls
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             # No tool calls, return the text as-is (remove <|im_end|> if present)
             content = text.replace(self.im_end_token, "").strip()
-            return content, []
+            return content, [], reward_info
 
         # Find all tool call matches
         matches = self.tool_call_regex.findall(text)
         function_calls = []
 
-        for match in matches:
-            try:
+        error_text = None
+        try:
+            for match in matches:
                 # Parse the JSON inside the tool_call tags
                 function_call = json.loads(match.strip())
 
@@ -153,18 +191,21 @@ class QwenToolParser(ToolParser):
                         arguments_str = str(arguments)
 
                     function_calls.append(FunctionCall(name=name, arguments=arguments_str))
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse tool call JSON: {match[:100]}... Error: {e}")
-            except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}, match: {match[:100]}")
+        except Exception as e:
+            logger.error(f"Failed to decode tool call: {str(e)}, match: {match[:100]}")
+            error_text = str(e)
+            function_calls = []
 
-        # Remove tool calls from the text to get remaining content
-        content = self.tool_call_regex.sub("", text)
+        if error_text is not None:
+            content = error_text
+        else:
+            # Remove tool calls from the text to get remaining content
+            content = self.tool_call_regex.sub("", text)
 
-        # Remove Qwen-specific tokens
-        content = content.replace(self.im_end_token, "").strip()
+            # Remove Qwen-specific tokens
+            content = content.replace(self.im_end_token, "").strip()
 
-        return content, function_calls
+        return content, function_calls, reward_info
 
 
 @register("tau_agent")
@@ -257,11 +298,13 @@ class TauAgentLoop(AgentLoopBase):
         # 3. 初始化 messages：system(wiki) + user(observation)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": wiki},
-            {"role": "user", "content": obs},
+            {"role": "user", "content": obs, "model_name": env_reset_res.model_name},
         ]
 
         # 4. Tau 风格的多步交互循环
-        total_reward = 0.0
+        answer_reward = 0.0
+        tool_call_token_rewards: list[float] = []
+        tool_call_content_format_rewards: list[float] = []
 
         # 为 VERL 构造 token 序列
         # prompt_ids: 只包含初始 prompt (system + 第一轮 user)
@@ -320,15 +363,11 @@ class TauAgentLoop(AgentLoopBase):
             if output.log_probs:
                 all_response_logprobs.extend(output.log_probs)
 
-            # 4.3 使用 VERL 的 ToolParser 从 token_ids 中解析 tool_calls
-            if hasattr(self, "tool_parser"):
-                response_text, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
-            else:
-                # 退化为纯文本回复（不解析工具）
-                response_text = await self.loop.run_in_executor(
-                    None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
-                )
-                tool_calls = []
+            # 4.3 使用 VERL 的 ToolParser 从 token_ids 中解析 tool_calls并计算reward
+            response_text, tool_calls, reward_info = await self.tool_parser.extract_tool_calls(response_ids, compute_reward=True)
+            if len(reward_info) > 0:
+                tool_call_token_rewards.append(reward_info["tool_call_token_reward"])
+                tool_call_content_format_rewards.append(reward_info["tool_call_content_format_reward"])
             
             # 构造 OpenAI 风格的 assistant message，兼容 tau-bench 的 message_to_action
             if tool_calls:
@@ -362,7 +401,7 @@ class TauAgentLoop(AgentLoopBase):
             with simple_timer("tool_calls", metrics):
                 env_response = isolated_env.step(action)
             step_reward = getattr(env_response, "reward", 0.0)
-            total_reward = step_reward  # 也可以按需要改为累加
+            answer_reward = max(answer_reward, step_reward)  # 也可以按需要改为累加
 
             env_info = env_response.info
             if hasattr(env_info, "model_dump"):
@@ -412,7 +451,7 @@ class TauAgentLoop(AgentLoopBase):
                 if all_response_logprobs:
                     all_response_logprobs.extend([0.0] * len(tool_response_ids))
             else:
-                user_message = {"role": "user", "content": env_response.observation}
+                user_message = {"role": "user", "content": env_response.observation, "model_name": env_response.model_name}
                 messages.extend([assistant_message, user_message])
                 
                 # 将 user 响应 tokenize 并添加到 response_ids，mask 设为 0
@@ -468,6 +507,44 @@ class TauAgentLoop(AgentLoopBase):
             final_response_mask = all_response_mask
             final_response_logprobs = all_response_logprobs or None
 
+
+        # ==================计算总reward==================
+        answer_reward_weight = 0.5
+        tool_call_token_reward_weight = 0.2
+        tool_call_content_format_reward_weight = 0.3
+        total_reward = \
+            answer_reward_weight * answer_reward + \
+            tool_call_token_reward_weight * sum(tool_call_token_rewards) / max(len(tool_call_token_rewards), 1) + \
+            tool_call_content_format_reward_weight * sum(tool_call_content_format_rewards) / max(len(tool_call_content_format_rewards), 1)
+        # ==================计算总reward==================
+
+
+        # ==================保存rollout结果==================
+        save_dir = "./rollout_res"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 生成文件名：时间戳 + 唯一hash
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        unique_hash = uuid4().hex[:8]
+        filename = f"{timestamp_str}_{unique_hash}.json"
+        filepath = os.path.join(save_dir, filename)
+        
+        # 准备保存的数据
+        messages_to_dump = messages
+        rollout_data = {
+            "messages": messages_to_dump,
+            "task_index": task_index,
+            "total_reward": total_reward,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        # 保存为JSON
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(rollout_data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Saved rollout result to {filepath}")
+        # ==================保存rollout结果==================
+
         output = AgentLoopOutput(
             prompt_ids=final_prompt_ids,
             response_ids=final_response_ids,
@@ -479,3 +556,11 @@ class TauAgentLoop(AgentLoopBase):
             extra_fields={"messages": messages, "task_id": task_index},
         )
         return output
+
+
+def compute_finegrained_reward(messages: list[dict[str, Any]]) -> float:
+    """
+    Compute format reward:
+    1. <tool_call> end with </tool_call>
+    2. <tool_call> content </tool_call> -> content is not empty; content is json format
+    """

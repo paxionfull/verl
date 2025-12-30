@@ -9,6 +9,8 @@ max_prompt_length=8192
 max_response_length=8192
 
 use_kl_loss=False
+kl_loss_coef=0.001
+kl_loss_type=low_var_kl
 adv_estimator=grpo
 n_rollout=4
 use_dynamic_bsz=True
@@ -25,7 +27,7 @@ interaction_config_path=/mnt/public/algm/yzy/train_repos/verl/yzy/interaction_co
 agent_loop_type=tau_agent
 tool_config_path=/mnt/public/algm/yzy/train_repos/verl/yzy/tool_config/tau_tool_config.yaml
 
-export EXPERIMENT_NAME="qwen2_5_3b_agentrl_tau1_retail"
+export EXPERIMENT_NAME="qwen3_4b_inst_agentrl_tau1_retail"
 
 export WITHLENGTH=0
 export REFINEDREWARD=0
@@ -78,15 +80,14 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
  actor_rollout_ref.rollout.n=${n_rollout} \
  actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
+ actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+ actor_rollout_ref.actor.kl_loss_type=${kl_loss_type} \
  actor_rollout_ref.rollout.agent.default_agent_loop=${agent_loop_type} \
  actor_rollout_ref.rollout.agent.num_workers=${rollout_num_workers} \
  actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
  actor_rollout_ref.rollout.response_length=${max_response_length} \
  +actor_rollout_ref.rollout.engine_kwargs.vllm.enable_auto_tool_choice=true \
  +actor_rollout_ref.rollout.engine_kwargs.vllm.tool_call_parser=hermes \
- actor_rollout_ref.rollout.trace.backend=weave \
- actor_rollout_ref.rollout.trace.token2text=True \
- actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=8 \
  trainer.logger='["console","wandb"]' \
  trainer.val_before_train=False \
  trainer.n_gpus_per_node=${n_gpus_per_node} \
@@ -100,3 +101,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 
 #  actor_rollout_ref.rollout.multi_turn.tool_config_path=${tool_config_path} \
 #  actor_rollout_ref.rollout.multi_turn.interaction_config_path=${interaction_config_path} \
+
+#  actor_rollout_ref.rollout.trace.backend=weave \
+#  actor_rollout_ref.rollout.trace.token2text=True \
+#  actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=8 \
