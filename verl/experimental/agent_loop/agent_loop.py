@@ -476,8 +476,8 @@ class AgentLoopWorkerBase:
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
-        print(len(output.prompt_ids))
-        print(len(output.response_ids))
+        # print(len(output.prompt_ids))
+        # print(len(output.response_ids))
         # print(output.extra_fields["messages"][1:])
 
         if "raw_prompt" in kwargs:
@@ -517,24 +517,48 @@ class AgentLoopWorkerBase:
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
         self.tokenizer.padding_side = "right"
-        response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
+        # 处理 response_ids 为空的情况
+        if not output.response_ids:
+            # 如果 response_ids 为空，手动创建全零的 tensor
+            response_output = {
+                "input_ids": torch.zeros((1, self.config.actor_rollout_ref.rollout.response_length), dtype=torch.long),
+                "attention_mask": torch.zeros((1, self.config.actor_rollout_ref.rollout.response_length), dtype=torch.long),
+            }
+        else:
+            response_output = self.tokenizer.pad(
+                {"input_ids": output.response_ids},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            # 确保返回的是 tensor，如果不是则转换（处理某些版本的 transformers 可能返回 list 的情况）
+            if isinstance(response_output["input_ids"], list):
+                response_output["input_ids"] = torch.tensor(response_output["input_ids"], dtype=torch.long)
+            if isinstance(response_output["attention_mask"], list):
+                response_output["attention_mask"] = torch.tensor(response_output["attention_mask"], dtype=torch.long)
+        
         if response_output["input_ids"].dim() == 1:
             response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
-        response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=False,
-        )
+        # 处理 response_mask 为空的情况
+        if not output.response_mask:
+            response_mask_output = {
+                "input_ids": torch.zeros((1, self.config.actor_rollout_ref.rollout.response_length), dtype=torch.long),
+            }
+        else:
+            response_mask_output = self.tokenizer.pad(
+                {"input_ids": output.response_mask},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.response_length,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )
+            # 确保返回的是 tensor
+            if isinstance(response_mask_output["input_ids"], list):
+                response_mask_output["input_ids"] = torch.tensor(response_mask_output["input_ids"], dtype=torch.long)
+        
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 

@@ -208,7 +208,10 @@ def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
     output = {key: [] for key in keys}
     for data in list_of_dict:
         for key, item in data.items():
-            assert key in output
+            try:
+                assert key in output
+            except AssertionError as e:
+                import pdb; pdb.set_trace()
             output[key].append(item)
     return output
 

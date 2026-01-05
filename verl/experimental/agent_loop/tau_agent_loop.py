@@ -167,7 +167,7 @@ class QwenToolParser(ToolParser):
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             # No tool calls, return the text as-is (remove <|im_end|> if present)
             content = text.replace(self.im_end_token, "").strip()
-            return content, [], reward_info
+            return content, None, [], reward_info
 
         # Find all tool call matches
         matches = self.tool_call_regex.findall(text)
@@ -196,16 +196,16 @@ class QwenToolParser(ToolParser):
             error_text = str(e)
             function_calls = []
 
-        if error_text is not None:
-            content = error_text
-        else:
+        if error_text is None:
             # Remove tool calls from the text to get remaining content
             content = self.tool_call_regex.sub("", text)
 
             # Remove Qwen-specific tokens
             content = content.replace(self.im_end_token, "").strip()
+        else:
+            content = text
 
-        return content, function_calls, reward_info
+        return content, error_text, function_calls, reward_info
 
 
 @register("tau_agent")
@@ -243,6 +243,56 @@ class TauAgentLoop(AgentLoopBase):
 
         cls.tool_parser = ToolParser.get_tool_parser(parser_format, cls.tokenizer)
 
+    async def _retry_sync_call(
+        self,
+        func,
+        *args,
+        max_retries: int = 20,
+        retry_delay: float = 3.0,
+        operation_name: str = "operation",
+        **kwargs
+    ):
+        """封装同步函数的重试逻辑
+        
+        Args:
+            func: 要执行的同步函数
+            *args: 位置参数
+            max_retries: 最大重试次数
+            retry_delay: 重试延迟（秒）
+            operation_name: 操作名称（用于日志）
+            **kwargs: 关键字参数
+        
+        Returns:
+            函数执行结果
+        """
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # 同步函数放到线程池执行，避免阻塞事件循环
+                result = await self.loop.run_in_executor(
+                    None, lambda: func(*args, **kwargs)
+                )
+                return result
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"{operation_name} failed (attempt {attempt + 1}/{max_retries}): "
+                        f"{type(e).__name__}: {e}. Retrying in {retry_delay}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error(
+                        f"{operation_name} failed after {max_retries} attempts: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    raise
+        
+        raise RuntimeError(
+            f"{operation_name} failed after {max_retries} attempts. Last error: {last_error}"
+        )
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         """
@@ -267,7 +317,7 @@ class TauAgentLoop(AgentLoopBase):
         user_provider = "openai"  # 环境变量中修改key和url
         task_split = "train"
         task_index = kwargs["task_index"]
-        max_num_steps = 10
+        max_num_steps = 30
         wiki = kwargs["wiki"]
 
         if env_name is None or user_strategy is None or user_model is None or user_provider is None:
@@ -277,18 +327,28 @@ class TauAgentLoop(AgentLoopBase):
                 f"Got extra_info={extra_info}"
             )
 
-        # 2. 创建 tau-bench 的 env，并初始化任务
-        isolated_env = get_env(
+        # 2. 创建 tau-bench 的 env，并初始化任务（带重试机制）
+        isolated_env = await self._retry_sync_call(
+            get_env,
             env_name,
             user_strategy=user_strategy,
             user_model=user_model,
             task_split=task_split,
             user_provider=user_provider,
             task_index=task_index,
+            max_retries=20,
+            retry_delay=3.0,
+            operation_name="get_env",
         )
         tools = isolated_env.tools_info
 
-        env_reset_res = isolated_env.reset(task_index=task_index)
+        env_reset_res = await self._retry_sync_call(
+            isolated_env.reset,
+            task_index=task_index,
+            max_retries=20,
+            retry_delay=3.0,
+            operation_name="env.reset",
+        )
         obs = env_reset_res.observation
         if hasattr(env_reset_res.info, "model_dump"):
             info = env_reset_res.info.model_dump()
@@ -348,6 +408,39 @@ class TauAgentLoop(AgentLoopBase):
                 initial_prompt_ids = prompt_ids
 
             # 4.2 调用 VERL 的 AsyncLLMServerManager 进行生成
+            # 先检查 prompt_ids 长度，避免触发 CUDA 错误
+            max_model_len = self.prompt_length + self.response_length
+            if len(prompt_ids) >= max_model_len:
+                logger.warning(
+                    f"Prompt too long: {len(prompt_ids)} >= {max_model_len}. "
+                    f"Skipping generation. task_index={task_index}, turn_idx={turn_idx}"
+                )
+                # 返回一个"空"但有效的 AgentLoopOutput
+                # 确保 extra_fields 包含所有必要的字段，避免 DataProto.concat 时 keys 不一致
+                extra_fields = {
+                    "messages": messages,
+                    "task_id": task_index,
+                    "skipped": True,
+                    "reward_extra_info": {},  # 添加空字典，避免后续合并时缺少这个 key
+                }
+                # 如果 kwargs 中有 raw_prompt 或 instruction，也要添加（与 _agent_loop_postprocess 保持一致）
+                if "raw_prompt" in kwargs:
+                    extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+                elif "instruction" in kwargs:
+                    extra_fields["raw_prompt"] = kwargs["instruction"]
+                
+                return AgentLoopOutput(
+                    prompt_ids=initial_prompt_ids[:self.prompt_length] if turn_idx > 0 else prompt_ids[:self.prompt_length],
+                    response_ids=[],
+                    response_mask=[],
+                    response_logprobs=None,
+                    multi_modal_data={},
+                    reward_score=0.0,
+                    metrics=metrics,
+                    extra_fields=extra_fields,
+                )
+
+            # 正常调用 generate
             with simple_timer("generate_sequences", metrics):
                 output = await self.server_manager.generate(
                     request_id=uuid4().hex,
@@ -364,7 +457,7 @@ class TauAgentLoop(AgentLoopBase):
                 all_response_logprobs.extend(output.log_probs)
 
             # 4.3 使用 VERL 的 ToolParser 从 token_ids 中解析 tool_calls并计算reward
-            response_text, tool_calls, reward_info = await self.tool_parser.extract_tool_calls(response_ids, compute_reward=True)
+            response_text, error_text, tool_calls, reward_info = await self.tool_parser.extract_tool_calls(response_ids, compute_reward=True)
             if len(reward_info) > 0:
                 tool_call_token_rewards.append(reward_info["tool_call_token_reward"])
                 tool_call_content_format_rewards.append(reward_info["tool_call_content_format_reward"])
@@ -395,31 +488,54 @@ class TauAgentLoop(AgentLoopBase):
                 }
 
             # 4.4 通过 tau-bench 的 message_to_action 将 message 映射为 Action
-            action = message_to_action(assistant_message)
+            if error_text is not None:
+                action_observation = error_text
+                env_response_model_name = "error"
+            else:
+                action_observation = None
+                try:
+                    action = message_to_action(assistant_message)
+                except Exception as e:
+                    logger.error(f"Failed to convert assistant message to action: {str(e)}, assistant_message: {assistant_message}")
+                    action_observation = {"error": str(e)}
+                    env_response_model_name = "error"
 
-            # 4.5 与 tau-bench env 交互：env.step(action)
-            with simple_timer("tool_calls", metrics):
-                env_response = isolated_env.step(action)
-            step_reward = getattr(env_response, "reward", 0.0)
-            answer_reward = max(answer_reward, step_reward)  # 也可以按需要改为累加
+            if action_observation is None:
+                # 4.5 与 tau-bench env 交互：env.step(action)，带重试机制
+                with simple_timer("tool_calls", metrics):
+                    env_response = await self._retry_sync_call(
+                        isolated_env.step,
+                        action,
+                        max_retries=20,
+                        retry_delay=3.0,
+                        operation_name="env.step",
+                    )
+                step_reward = getattr(env_response, "reward", 0.0)
+                answer_reward = max(answer_reward, step_reward)  # 也可以按需要改为累加
 
-            env_info = env_response.info
-            if hasattr(env_info, "model_dump"):
-                env_info = env_info.model_dump()
-            info = {**info, **(env_info or {})}
+                env_info = env_response.info
+                if hasattr(env_info, "model_dump"):
+                    env_info = env_info.model_dump()
+                info = {**info, **(env_info or {})}
+
+                env_observation = env_response.observation
+                env_response_model_name = env_response.model_name
 
             # 4.6 按 TauBench 方式更新 messages（tool 调用 vs 普通回复）
             # 同时将 user/tool 响应添加到 response_ids，mask 设为 0（不监督）
-            if action.name != RESPOND_ACTION_NAME and tool_calls:
-                # 只保留第一个 tool_call，仿照 tau-bench 的切片逻辑
-                assistant_message["tool_calls"] = assistant_message["tool_calls"][:1]
-                tc = assistant_message["tool_calls"][0]
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "content": env_response.observation,
-                }
+            if (action.name != RESPOND_ACTION_NAME and tool_calls) or (error_text is not None):
+                if error_text is not None:
+                    tool_message = {"role": "tool", "content": action_observation, "model_name": env_response_model_name}
+                else:
+                    # 只保留第一个 tool_call，仿照 tau-bench 的切片逻辑 # TODO: 如果有多于一个 tool_call，需要修改
+                    assistant_message["tool_calls"] = assistant_message["tool_calls"][:1]
+                    tc = assistant_message["tool_calls"][0]
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": env_response.observation,
+                    }
                 messages.extend([assistant_message, tool_message])
                 
                 # 将 tool 响应 tokenize 并添加到 response_ids，mask 设为 0
@@ -451,7 +567,7 @@ class TauAgentLoop(AgentLoopBase):
                 if all_response_logprobs:
                     all_response_logprobs.extend([0.0] * len(tool_response_ids))
             else:
-                user_message = {"role": "user", "content": env_response.observation, "model_name": env_response.model_name}
+                user_message = {"role": "user", "content": env_observation, "model_name": env_response_model_name}
                 messages.extend([assistant_message, user_message])
                 
                 # 将 user 响应 tokenize 并添加到 response_ids，mask 设为 0
@@ -509,9 +625,9 @@ class TauAgentLoop(AgentLoopBase):
 
 
         # ==================计算总reward==================
-        answer_reward_weight = 0.5
-        tool_call_token_reward_weight = 0.2
-        tool_call_content_format_reward_weight = 0.3
+        answer_reward_weight = 0.8
+        tool_call_token_reward_weight = 0.1
+        tool_call_content_format_reward_weight = 0.1
         total_reward = \
             answer_reward_weight * answer_reward + \
             tool_call_token_reward_weight * sum(tool_call_token_rewards) / max(len(tool_call_token_rewards), 1) + \
@@ -520,31 +636,45 @@ class TauAgentLoop(AgentLoopBase):
 
 
         # ==================保存rollout结果==================
-        save_dir = "./rollout_res"
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # 生成文件名：时间戳 + 唯一hash
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        unique_hash = uuid4().hex[:8]
-        filename = f"{timestamp_str}_{unique_hash}.json"
-        filepath = os.path.join(save_dir, filename)
-        
-        # 准备保存的数据
-        messages_to_dump = messages
-        rollout_data = {
-            "messages": messages_to_dump,
-            "task_index": task_index,
-            "total_reward": total_reward,
-            "timestamp": datetime.now().isoformat(),
-        }
-        
-        # 保存为JSON
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(rollout_data, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"Saved rollout result to {filepath}")
+        if os.environ.get("SAVE_ROLLOUT", "false").lower() == "true":
+            save_dir = "./rollout_res"
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # 生成文件名：时间戳 + 唯一hash
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            unique_hash = uuid4().hex[:8]
+            filename = f"{timestamp_str}_{unique_hash}.json"
+            filepath = os.path.join(save_dir, filename)
+            
+            # 准备保存的数据
+            messages_to_dump = messages
+            rollout_data = {
+                "messages": messages_to_dump,
+                "task_index": task_index,
+                "total_reward": total_reward,
+                "timestamp": datetime.now().isoformat(),
+            }
+            
+            # 保存为JSON
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(rollout_data, f, ensure_ascii=False, indent=2)
+            
+            # logger.info(f"Saved rollout result to {filepath}")
         # ==================保存rollout结果==================
 
+        # 确保 extra_fields 包含所有必要的字段，避免 DataProto.concat 时 keys 不一致
+        extra_fields = {
+            "messages": messages,
+            "task_id": task_index,
+            "skipped": False,  # 添加 skipped: False，确保所有样本都有这个字段
+            "reward_extra_info": {},  # 添加空字典，确保结构一致（与提前返回时保持一致）
+        }
+        # 如果 kwargs 中有 raw_prompt 或 instruction，也要添加（与 _agent_loop_postprocess 保持一致）
+        if "raw_prompt" in kwargs:
+            extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        elif "instruction" in kwargs:
+            extra_fields["raw_prompt"] = kwargs["instruction"]
+        
         output = AgentLoopOutput(
             prompt_ids=final_prompt_ids,
             response_ids=final_response_ids,
@@ -553,14 +683,7 @@ class TauAgentLoop(AgentLoopBase):
             multi_modal_data={},
             reward_score=total_reward,
             metrics=metrics,
-            extra_fields={"messages": messages, "task_id": task_index},
+            extra_fields=extra_fields,
         )
         return output
 
-
-def compute_finegrained_reward(messages: list[dict[str, Any]]) -> float:
-    """
-    Compute format reward:
-    1. <tool_call> end with </tool_call>
-    2. <tool_call> content </tool_call> -> content is not empty; content is json format
-    """
